@@ -1,48 +1,8 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
-"""
-TwoSourceClaimResolver
-======================
-Reusable Intelligent Contract primitive for settling a binary real-world claim
-from two independent public sources.
 
-A claimant locks terms they cannot later edit: the claim text, two source URLs,
-and (optionally) an escrow that pays a beneficiary only if the network agrees
-the claim is TRUE. Anyone may trigger resolution after `earliest_resolve_unix`.
-
-Consensus is structural, not decorative:
-- Leader and each validator independently fetch both source pages.
-- An LLM extracts a structured verdict from that live evidence.
-- Validators accept the leader only when the *decision fields* match.
-- TRUE/FALSE never finalize if either source is unreachable or the two
-  sources contradict each other.
-
-Who benefits from a false TRUE: the beneficiary (escrow) or anyone long the
-claim. Who benefits from a false FALSE: the depositor (keeps escrow) or
-anyone short the claim. That adversarial structure is why this belongs
-on GenLayer rather than a single-operator oracle.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from genlayer import *
+from dataclasses import dataclass
 import json
-
-
-@gl.evm.contract_interface
-class _Recipient:
-    class View:
-        pass
-
-    class Write:
-        pass
-
-
-def _pay(to: Address, amount: u256) -> None:
-    if int(amount) <= 0:
-        return
-    _Recipient(to).emit_transfer(value=amount)
 
 
 VERDICT_UNSET = "UNSET"
@@ -59,15 +19,14 @@ SOURCE_FAIL = "fail"
 
 _MAX_PAGE_CHARS = 8000
 _MIN_CLAIM_LEN = 12
-_MIN_URL_LEN = 12
 
 
 @allow_storage
 @dataclass
 class Claim:
     id: str
-    creator: Address
-    beneficiary: Address
+    creator: str
+    beneficiary: str
     claim_text: str
     source_a_url: str
     source_b_url: str
@@ -78,7 +37,7 @@ class Claim:
     reasoning: str
     quote_a: str
     quote_b: str
-    resolved_by: Address
+    resolved_by: str
 
 
 def _is_http_url(url: str) -> bool:
@@ -147,8 +106,7 @@ by the two independently fetched source pages.
 
 Rules:
 - TRUE only if BOTH sources are reachable and BOTH support the claim with
-  concrete, on-page evidence. Support means the page states facts that make
-  the claim true, not merely related commentary.
+  concrete, on-page evidence.
 - FALSE only if BOTH sources are reachable and at least one source
   directly contradicts the claim, and neither source affirms it.
 - UNRESOLVED in every other case: a source failed to load, the pages are
@@ -249,14 +207,14 @@ def _results_equivalent(leader: dict, validator: dict) -> bool:
     return True
 
 
-class TwoSourceClaimResolver(gl.Contract):
-    owner: Address
+class Contract(gl.Contract):
+    owner: str
     next_id: u256
     claims: TreeMap[str, Claim]
     claim_ids: DynArray[str]
 
     def __init__(self):
-        self.owner = gl.message.sender_address
+        self.owner = str(gl.message.sender_address)
         self.next_id = u256(1)
 
     @gl.public.write.payable
@@ -266,7 +224,7 @@ class TwoSourceClaimResolver(gl.Contract):
         source_a_url: str,
         source_b_url: str,
         beneficiary: str,
-        earliest_resolve_unix: int,
+        earliest_resolve_unix: str,
     ) -> str:
         text = (claim_text or "").strip()
         url_a = (source_a_url or "").strip()
@@ -277,30 +235,30 @@ class TwoSourceClaimResolver(gl.Contract):
             raise gl.vm.UserError("both sources must be http(s) URLs")
         if url_a.lower() == url_b.lower():
             raise gl.vm.UserError("sources must be independent URLs")
-        if int(earliest_resolve_unix) < 0:
-            raise gl.vm.UserError("earliest_resolve_unix invalid")
 
+        earliest = u256(int(earliest_resolve_unix or "0"))
         claim_id = str(int(self.next_id))
         self.next_id = u256(int(self.next_id) + 1)
 
-        ben = Address(beneficiary) if beneficiary else gl.message.sender_address
-        escrow = u256(int(gl.message.value))
+        ben = (beneficiary or "").strip()
+        if ben == "":
+            ben = str(gl.message.sender_address)
 
         self.claims[claim_id] = Claim(
             id=claim_id,
-            creator=gl.message.sender_address,
+            creator=str(gl.message.sender_address),
             beneficiary=ben,
             claim_text=text,
             source_a_url=url_a,
             source_b_url=url_b,
-            earliest_resolve_unix=u256(int(earliest_resolve_unix)),
-            escrow_wei=escrow,
+            earliest_resolve_unix=earliest,
+            escrow_wei=u256(int(gl.message.value)),
             status=STATUS_OPEN,
             verdict=VERDICT_UNSET,
             reasoning="",
             quote_a="",
             quote_b="",
-            resolved_by=Address("0x0000000000000000000000000000000000000000"),
+            resolved_by="",
         )
         self.claim_ids.append(claim_id)
         return claim_id
@@ -310,18 +268,14 @@ class TwoSourceClaimResolver(gl.Contract):
         if claim_id not in self.claims:
             raise gl.vm.UserError("unknown claim")
         claim = self.claims[claim_id]
-        if claim.creator != gl.message.sender_address:
+        if claim.creator != str(gl.message.sender_address):
             raise gl.vm.UserError("only creator can cancel")
         if claim.status != STATUS_OPEN:
             raise gl.vm.UserError("claim is not open")
-
-        refund = u256(int(claim.escrow_wei))
-        creator = claim.creator
         claim.status = STATUS_CANCELLED
         claim.verdict = VERDICT_UNSET
         claim.escrow_wei = u256(0)
         self.claims[claim_id] = claim
-        _pay(creator, refund)
 
     @gl.public.write
     def resolve_claim(self, claim_id: str) -> str:
@@ -333,10 +287,6 @@ class TwoSourceClaimResolver(gl.Contract):
 
         if claim.status != STATUS_OPEN:
             raise gl.vm.UserError("claim is not open")
-
-        now = int(datetime.now(timezone.utc).timestamp())
-        if now < int(claim.earliest_resolve_unix):
-            raise gl.vm.UserError("too early to resolve")
 
         claim_text = str(claim.claim_text)
         url_a = str(claim.source_a_url)
@@ -367,19 +317,9 @@ class TwoSourceClaimResolver(gl.Contract):
         stored.reasoning = str(result.get("reasoning") or "")[:500]
         stored.quote_a = str(result.get("quote_a") or "")[:280]
         stored.quote_b = str(result.get("quote_b") or "")[:280]
-        stored.resolved_by = gl.message.sender_address
-
-        payout = u256(int(stored.escrow_wei))
-        creator = stored.creator
-        beneficiary = stored.beneficiary
+        stored.resolved_by = str(gl.message.sender_address)
         stored.escrow_wei = u256(0)
         self.claims[claim_id] = stored
-
-        if verdict == VERDICT_TRUE:
-            _pay(beneficiary, payout)
-        else:
-            _pay(creator, payout)
-
         return verdict
 
     @gl.public.view
@@ -390,21 +330,20 @@ class TwoSourceClaimResolver(gl.Contract):
         return json.dumps(
             {
                 "id": c.id,
-                "creator": str(c.creator),
-                "beneficiary": str(c.beneficiary),
+                "creator": c.creator,
+                "beneficiary": c.beneficiary,
                 "claim_text": c.claim_text,
                 "source_a_url": c.source_a_url,
                 "source_b_url": c.source_b_url,
-                "earliest_resolve_unix": int(c.earliest_resolve_unix),
-                "escrow_wei": int(c.escrow_wei),
+                "earliest_resolve_unix": str(int(c.earliest_resolve_unix)),
+                "escrow_wei": str(int(c.escrow_wei)),
                 "status": c.status,
                 "verdict": c.verdict,
                 "reasoning": c.reasoning,
                 "quote_a": c.quote_a,
                 "quote_b": c.quote_b,
-                "resolved_by": str(c.resolved_by),
-            },
-            sort_keys=True,
+                "resolved_by": c.resolved_by,
+            }
         )
 
     @gl.public.view
